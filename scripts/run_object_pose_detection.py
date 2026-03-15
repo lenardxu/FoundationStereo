@@ -14,8 +14,10 @@ python run_object_pose_detection.py \
 """
 
 import json
-from typing import Tuple, Union, List
+from typing import Tuple, Union, List, Optional
 import os,sys
+import pathlib
+import copy
 import argparse
 import imageio
 import torch
@@ -37,6 +39,8 @@ from accelerate import Accelerator
 import torch
 
 from detection import QWENVDetector
+from measurement import calculate_point_cloud_principle_axes
+from registration import register_point_clouds_using_axis_point
 
 
 os.environ["all_proxy"] = "https://socks.127.0.0.1:7890"
@@ -60,13 +64,16 @@ def overlay_masks(image, masks):
         image = Image.alpha_composite(image, overlay)
     return image
 
-
 def rectify_stereo_images(
     img_left: Union[str, np.ndarray], img_right: Union[str, np.ndarray],
-    K1, D1, 
-    K2, D2,
-    R, T  
+    K1: np.ndarray, D1: Optional[np.ndarray], 
+    K2: np.ndarray, D2: Optional[np.ndarray],
+    R: np.ndarray, T: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rectify stereo images given their intrinsics and extrinsics.
+
+    """
     if isinstance(img_left, str):
         img_left_arr = cv2.imread(img_left)
     else:
@@ -75,19 +82,19 @@ def rectify_stereo_images(
         img_right_arr = cv2.imread(img_right)
     else:
         img_right_arr = img_right
-    h, w = img_left_arr.shape[:2]
+    height, width = img_left_arr.shape[:2]
 
     # --- Stereo rectification ---
     R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
         K1, D1, K2, D2,
-        (w, h), R, T,
+        (width, height), R, T,
         flags=cv2.CALIB_ZERO_DISPARITY,  # align principal points (recommended)
         alpha=0,  # 0 = crop to valid pixels only; 1 = keep all pixels
     )
 
     # --- Build rectification maps ---
-    map1x, map1y = cv2.initUndistortRectifyMap(K1, D1, R1, P1, (w, h), cv2.CV_32FC1)
-    map2x, map2y = cv2.initUndistortRectifyMap(K2, D2, R2, P2, (w, h), cv2.CV_32FC1)
+    map1x, map1y = cv2.initUndistortRectifyMap(K1, D1, R1, P1, (width, height), cv2.CV_32FC1)
+    map2x, map2y = cv2.initUndistortRectifyMap(K2, D2, R2, P2, (width, height), cv2.CV_32FC1)
 
     # --- Remap ---
     rect_left  = cv2.remap(img_left_arr,  map1x, map1y, cv2.INTER_LINEAR)
@@ -347,12 +354,79 @@ if __name__=="__main__":
             vis.get_render_option().background_color = np.array([0.5, 0.5, 0.5])
             vis.run()
             vis.destroy_window()
+    
+    # Load the mesh model of the reference object (e.g. from a obj file)
+    mesh_filepath: str = ""
+    enable_post_processing = True
+    print_progress = True
+    converted_path = pathlib.Path(mesh_filepath)
+    if not converted_path.is_file():
+        raise FileNotFoundError(f"Filepath {mesh_filepath} does not exist.")
+    reference_mesh = o3d.io.read_triangle_mesh(str(converted_path), 
+                                                enable_post_processing,
+                                                print_progress)
+    if len(reference_mesh.vertices) == 0 or len(reference_mesh.triangles) == 0:
+        raise RuntimeError("Mesh load failed or OBJ contains no valid triangles.")
+    
+    # Convert mesh to point cloud
+    num_points = 50000
+    reference_mesh.compute_vertex_normals()
+    reference_pcd = reference_mesh.sample_points_uniformly(
+        number_of_points=num_points
+    )
+    # Visualize the reference point cloud for debugging
+    o3d.visualization.draw_geometries([reference_mesh], mesh_show_back_face=True)
+    o3d.visualization.draw_geometries([reference_pcd])
+
+    # Scale the scene point cloud to meter (if needed)
+    scale_factor = 1.0
+    retain_input_geometry = False
+    print(f"Point cloud bounds (min) before scaling: {pcd.get_min_bound()}")
+    print(f"Point cloud bounds (max) before scaling: {pcd.get_max_bound()}")
+    if scale_factor != 1.0:
+        if retain_input_geometry:
+            cloud_copy = copy.deepcopy(pcd)
+            scaled_cloud = cloud_copy.scale(scale_factor, pcd.get_center())
+        else:
+            scaled_cloud = pcd.scale(scale_factor, pcd.get_center())
+    else:
+        scaled_cloud = pcd
+    print(f"Point cloud bounds (min) after scaling: {scaled_cloud.get_min_bound()}")
+    print(f"Point cloud bounds (max) after scaling: {scaled_cloud.get_max_bound()}")
+
+    # Voxel downsample both the reference point cloud and the observed point cloud
+    voxel_size = 0.001
+    reference_voxel_size = 0.001
+    print(f"Pcd of points before voxel downsampling: {len(scaled_cloud.points)}.")
+    downsampled_pcd = scaled_cloud.voxel_down_sample(voxel_size=voxel_size)
+    print(f"Voxel downsampling filter returns pcd of points: {len(downsampled_pcd.points)}.")
+    print(f"Pcd of points before voxel downsampling: {len(reference_pcd.points)}.")
+    downsampled_reference_pcd = reference_pcd.voxel_down_sample(voxel_size=reference_voxel_size)
+    print(f"Voxel downsampling filter returns reference pcd of points: {len(downsampled_reference_pcd.points)}.")
+    o3d.visualization.draw_geometries([downsampled_pcd, downsampled_reference_pcd], mesh_show_back_face=True)
+
+    # Compute the preliminary alignment by aligning the centroids and first principal axis of both point clouds
+    #  -> Transformation from the reference point cloud (e.g. canonical object model) to the scene point cloud (e.g. observed point cloud in the camera frame)
+    pcd_centroid: np.ndarray = scaled_cloud.get_center()
+    reference_pcd_centroid: np.ndarray = reference_pcd.get_center()
+    pcd_1st_principal_axis: np.ndarray = calculate_point_cloud_principle_axes(
+        scaled_cloud, use_pca=True, axis_selection="first"
+    )
+    reference_pcd_1st_principal_axis: np.ndarray = calculate_point_cloud_principle_axes(
+        reference_pcd, use_pca=True, axis_selection="first"
+    )
+    T_reference2scene, _ =register_point_clouds_using_axis_point(
+        source_axis=reference_pcd_1st_principal_axis, 
+        source_point=reference_pcd_centroid, 
+        target_axis=pcd_1st_principal_axis, 
+        target_point=pcd_centroid
+    )
+    # Visualize the preliminary alignment result by transforming the reference point cloud with the estimated transformation 
+    # and visualizing it together with the scene point cloud
+    transformed_reference_pcd = copy.deepcopy(reference_pcd).transform(T_reference2scene)
+    o3d.visualization.draw_geometries([scaled_cloud, transformed_reference_pcd], mesh_show_back_face=True)
 
     # TODO: steps in the next for object pose estimation in the conventional way
-    # 1) Load the mesh model of the target object (e.g. from a obj file)
-    # 2) Convert to pcd and downsample it, and downsample the observed point cloud as well
-    # 3) Ovelap both point clouds' centroid
-    # 4) Run ICP to get the pose of the object in the camera frame with visualization of the alignment result to verify the pose estimation quality
     # 5) Visualize the coordinate frame of the estimated pose in the point cloud as well
     # 6) Transform the estimated pose from the camera frame to the world frame using the camera extrinsics
     # 7) Validate the estimated pose by projecting the object mesh with the estimated pose back to the image and check if the projection aligns well with the observed object in the image (e.g. using a silhouette IoU metric or visualizing the overlay)
