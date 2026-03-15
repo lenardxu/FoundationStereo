@@ -6,7 +6,8 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-
+import json
+from typing import Tuple, Union, List
 import os,sys
 import argparse
 import imageio
@@ -21,6 +22,87 @@ from omegaconf import OmegaConf
 from core.utils.utils import InputPadder
 from Utils import set_logging_format, set_seed, vis_disparity, depth2xyzmap, toOpen3dCloud
 from core.foundation_stereo import FoundationStereo
+
+
+def rectify_stereo_images(
+    img_left: Union[str, np.ndarray], img_right: Union[str, np.ndarray],
+    K1, D1, 
+    K2, D2,
+    R, T  
+    ) -> Tuple[np.ndarray, np.ndarray]:
+  if isinstance(img_left, str):
+    img_left_arr = cv2.imread(img_left)
+  else:
+    img_left_arr = img_left
+  if isinstance(img_right, str):
+    img_right_arr = cv2.imread(img_right)
+  else:
+    img_right_arr = img_right
+  h, w = img_left_arr.shape[:2]
+
+  # --- Stereo rectification ---
+  R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+      K1, D1, K2, D2,
+      (w, h), R, T,
+      flags=cv2.CALIB_ZERO_DISPARITY,  # align principal points (recommended)
+      alpha=0,  # 0 = crop to valid pixels only; 1 = keep all pixels
+  )
+
+  # --- Build rectification maps ---
+  map1x, map1y = cv2.initUndistortRectifyMap(K1, D1, R1, P1, (w, h), cv2.CV_32FC1)
+  map2x, map2y = cv2.initUndistortRectifyMap(K2, D2, R2, P2, (w, h), cv2.CV_32FC1)
+
+  # --- Remap ---
+  rect_left  = cv2.remap(img_left_arr,  map1x, map1y, cv2.INTER_LINEAR)
+  rect_right = cv2.remap(img_right_arr, map2x, map2y, cv2.INTER_LINEAR)
+
+  return rect_left, rect_right
+
+def load_intrinsics_and_extrinsics(
+    path: Union[Tuple[str, str], List[Tuple[str, str]]],
+    inverse_extrinsics: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load camera intrinsics (K) and extrinsics (T_c2w) from one or more
+    calib.json files.
+
+    Each JSON file is expected to contain:
+        ``K``      – 3×3 intrinsic matrix.
+        ``T_c2w``  – 4×4 camera-to-world transformation matrix.
+
+    Args:
+        path: A single tuple of (intrinsics_path, extrinsics_path) or a list of such tuples (one per camera).
+        inverse_extrinsics: If True, invert the loaded T_c2w matrices.
+
+    Returns:
+        intrinsics  : np.ndarray of shape (N, 3, 3), dtype float64.
+        extrinsics  : np.ndarray of shape (N, 4, 4), dtype float64
+                      containing T_c2w as stored in the file.
+                      To obtain world-to-camera (w2c) matrices expected by
+                      the DA3 API, invert each matrix:
+                      ``w2c = np.linalg.inv(extrinsics)``.
+    """
+    if isinstance(path, tuple):
+        path = [path]
+
+    K_list, T_list = [], []
+    for intrinsics_path, extrinsics_path in path:
+        with open(intrinsics_path, "r") as f:
+            calib = json.load(f)
+        with open(extrinsics_path, "r") as f:
+            extrinsics_data = json.load(f)
+        if "K" not in calib:
+            raise ValueError(f"Invalid calib.json format in {intrinsics_path}: missing 'K'")
+        if "T_c2w" not in extrinsics_data:
+            raise ValueError(f"Invalid cam_extrinsics.json format in {extrinsics_path}: missing 'T_c2w'")
+        K_list.append(np.array(calib["K"], dtype=np.float64))
+        T_list.append(np.array(extrinsics_data["T_c2w"], dtype=np.float64) \
+                      if not inverse_extrinsics else np.linalg.inv(np.array(extrinsics_data["T_c2w"], dtype=np.float64)))
+
+    intrinsics  = np.stack(K_list)   # (N, 3, 3)
+    extrinsics  = np.stack(T_list)   # (N, 4, 4)
+    return intrinsics, extrinsics
+
 
 
 if __name__=="__main__":
@@ -57,6 +139,15 @@ if __name__=="__main__":
   logging.info(f"args:\n{args}")
   logging.info(f"Using pretrained model from {ckpt_dir}")
 
+  try:
+      model = FoundationStereo(args)
+  except ValueError as e:
+      if "Unknown scheme for proxy URL" in str(e):
+          os.environ["all_proxy"] = "https://socks.127.0.0.1:7890"
+          model = FoundationStereo(args)
+      else:
+        raise
+
   model = FoundationStereo(args)
 
   ckpt = torch.load(ckpt_dir)
@@ -67,8 +158,36 @@ if __name__=="__main__":
   model.eval()
 
   code_dir = os.path.dirname(os.path.realpath(__file__))
-  img0 = imageio.imread(args.left_file)
-  img1 = imageio.imread(args.right_file)
+
+  calib_rst_paths: List[Tuple[str, str]] = []
+  for image_path in (args.left_file, args.right_file):
+      # image:  <base>/<session>/<seq>/<camera_name>/<frame>.png
+      # calib:  <base>/<session>/<camera_name>/calib.json
+      image_dir = os.path.dirname(image_path)
+      image_name_stem = os.path.splitext(os.path.basename(image_path))[0]
+      camera_name = os.path.basename(os.path.dirname(image_path))           # e.g. left_hand_center_camera
+      session_dir = os.path.dirname(os.path.dirname(os.path.dirname(image_path)))  # up 3 levels → <session>
+      calib_rst_paths.append((os.path.join(session_dir, camera_name, "calib.json"), os.path.join(image_dir, f"cam_extrinsics_{image_name_stem}.json")))
+  intrinsics, extrinsics = load_intrinsics_and_extrinsics(calib_rst_paths)
+  K1, K2 = intrinsics[0], intrinsics[1]
+  D1, D2 = None, None
+  T_left_2_w, T_right_2_w = extrinsics[0], extrinsics[1]
+  T_left_2_right = np.linalg.inv(T_right_2_w) @ T_left_2_w
+  R_left_2_right = T_left_2_right[:3,:3]
+  t_left_2_right = T_left_2_right[:3,3]
+
+  left_img, right_img = rectify_stereo_images(
+      args.left_file, args.right_file, 
+      K1, 
+      D1, 
+      K2, 
+      D2,
+      R_left_2_right, 
+      t_left_2_right  
+  )
+  # rectify_stereo_images uses cv2 (BGR); convert to RGB to match imageio convention
+  img0 = cv2.cvtColor(left_img, cv2.COLOR_BGR2RGB)
+  img1 = cv2.cvtColor(right_img, cv2.COLOR_BGR2RGB)
   scale = args.scale
   assert scale<=1, "scale must be <=1"
   img0 = cv2.resize(img0, fx=scale, fy=scale, dsize=None)
@@ -103,8 +222,10 @@ if __name__=="__main__":
   if args.get_pc:
     with open(args.intrinsic_file, 'r') as f:
       lines = f.readlines()
-      K = np.array(list(map(float, lines[0].rstrip().split()))).astype(np.float32).reshape(3,3)
-      baseline = float(lines[1])
+      # K = np.array(list(map(float, lines[0].rstrip().split()))).astype(np.float32).reshape(3,3)
+      # baseline = float(lines[1])
+      K = K1.copy()  # use the left camera's intrinsic for point cloud generation
+      baseline = float(np.linalg.norm(t_left_2_right))  # use the actual baseline between the two cameras
     K[:2] *= scale
     depth = K[0,0]*baseline/disp
     np.save(f'{args.out_dir}/depth_meter.npy', depth)
