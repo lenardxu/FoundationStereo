@@ -537,14 +537,17 @@ class PointToPlaneICPRegistration(BaseRegistration):
         _params (dict): Dictionary containing ICP parameters (iterations, distance, normals estimation, robust kernel settings).
     """
 
-    def __init__(self,
-                 max_iterations: int = 50,
-                 max_correspondence_distance: float = 50,
-                 normal_search_radius: float = 0.001,
-                 normal_max_neighbors: int = 30,
-                 use_robust_kernel: bool = False,
-                 loss_type: str = "tukey_loss",
-                 noise_standard_deviation: float = 0.001):
+    def __init__(
+            self,
+            max_iterations: int = 50,
+            max_correspondence_distance: float = 50,
+            normal_search_radius: float = 0.02,
+            normal_max_neighbors: int = 30,
+            use_robust_kernel: bool = False,
+            loss_type: str = "tukey_loss",
+            noise_standard_deviation: float = 0.001,
+            min_fitness_score: float = 0.5,
+        ):
         """Initializes the point-to-plane ICP registration.
         
         Args:
@@ -592,6 +595,11 @@ class PointToPlaneICPRegistration(BaseRegistration):
                 f"Type validation failed in PointToPlaneICPRegistration.__init__: "
                 f"parameter 'noise_standard_deviation' expected float, got {type(noise_standard_deviation).__name__}"
             )
+        if not isinstance(min_fitness_score, (int, float)):
+            raise TypeError(
+                f"Type validation failed in PointToPlaneICPRegistration.__init__: "
+                f"parameter 'min_fitness_score' expected float, got {type(min_fitness_score).__name__}"
+            )
         super().__init__()
         self._params = {
             "max_iterations": max_iterations,
@@ -601,7 +609,8 @@ class PointToPlaneICPRegistration(BaseRegistration):
             "use_robust_kernel": use_robust_kernel,
             "loss_type": loss_type,
             "noise_standard_deviation": noise_standard_deviation,
-            "transformation_estimation_method": None
+            "transformation_estimation_method": None,
+            "min_fitness_score": min_fitness_score
         }
        
         self._update()
@@ -645,7 +654,7 @@ class PointToPlaneICPRegistration(BaseRegistration):
         print(f"[{self._class_name}.execute] Applying point-to-plane ICP registration.")
 
         if initial_transformation_matrix is None:
-            print(f"[Error] [{self._class_name}] ICP alignment failed. Initial transformation is None.")
+            print(f"[Error] [{self._class_name}.execute] ICP alignment failed. Initial transformation is None.")
             return np.eye(4), None
 
         # Reset cloud as None to avoid visualization of old cloud coming from last run of execute
@@ -664,23 +673,24 @@ class PointToPlaneICPRegistration(BaseRegistration):
         # Perform ICP
         try:
             result = o3d.pipelines.registration.registration_icp(
-            source_point_cloud,
-            target_point_cloud,
-            self._params["max_correspondence_distance"],
-            initial_transformation_matrix,  # Initial transformation
-            self._params["transformation_estimation_method"],
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=self._params["max_iterations"])
-        )
+                source_point_cloud,
+                target_point_cloud,
+                self._params["max_correspondence_distance"],
+                initial_transformation_matrix,  # Initial transformation
+                self._params["transformation_estimation_method"],
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=self._params["max_iterations"])
+            )
         except Exception as e:
-            print(f"[Error] [{self._class_name}] Error logging initial_transformation_matrix: {e}")
-        print(f"[{self._class_name}] {result}")
+            print(f"[Error] [{self._class_name}.execute] ICP failed with exception: {e}")
+            return np.eye(4), None
+        print(f"[{self._class_name}.execute] {result}")
 
         # Check if alignment was successful
-        if result.fitness < 0.5:
-            print(f"[Error] [{self._class_name}] ICP alignment failed. Low fitness score of {result.fitness}.")
+        if result.fitness < self._params["min_fitness_score"]:
+            print(f"[Error] [{self._class_name}.execute] ICP alignment failed. Low fitness score of {result.fitness}.")
             return np.eye(4), None
 
-        print(f"[Success] [{self._class_name}] ICP alignment successful.")
+        print(f"[Success] [{self._class_name}.execute] ICP alignment successful.")
         self._transformation = result.transformation
         metric = {}
         metric["correspondence_set"] = result.correspondence_set

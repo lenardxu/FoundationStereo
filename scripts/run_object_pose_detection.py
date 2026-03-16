@@ -40,10 +40,11 @@ import torch
 
 from detection import QWENVDetector
 from measurement import calculate_point_cloud_principle_axes
-from registration import register_point_clouds_using_axis_point, CuboidTranslationSamplerPointToPointICPRegistration
+from registration import register_point_clouds_using_axis_point, CuboidTranslationSamplerPointToPointICPRegistration, PointToPlaneICPRegistration
 
 
 os.environ["all_proxy"] = "https://socks.127.0.0.1:7890"
+
 
 def overlay_masks(image, masks):
     image = image.convert("RGBA")
@@ -316,6 +317,10 @@ if __name__=="__main__":
         disp[invalid] = np.inf
 
     # Retain only the disparity values corresponding to the target object mask, set the rest to infinity
+    viz_orig_pcd = True
+    orig_disp, orig_depth, orig_pcd = None, None, None
+    if viz_orig_pcd:
+        orig_disp = disp.copy()
     disp[~target_mask] = np.inf
 
     if args.get_pc:
@@ -338,6 +343,16 @@ if __name__=="__main__":
             pcd = pcd.select_by_index(keep_ids)
             o3d.io.write_point_cloud(f'{args.out_dir}/cloud.ply', pcd)
             logging.info(f"PCL saved to {args.out_dir}")
+
+            if viz_orig_pcd:
+                orig_depth = K[0,0]*baseline/orig_disp
+                orig_xyz_map = depth2xyzmap(orig_depth, K)
+                # Get points in the original left camera frame (e.g. for pose estimation relative to the physical camera)
+                orig_xyz_orig_map = (R_left_orig2rect.T @ orig_xyz_map.reshape(-1, 3).T).T.reshape(H, W, 3)
+                orig_pcd = toOpen3dCloud(orig_xyz_orig_map.reshape(-1,3), img0_ori.reshape(-1,3))
+                keep_mask = (np.asarray(orig_pcd.points)[:,2]>0) & (np.asarray(orig_pcd.points)[:,2]<=args.z_far)
+                keep_ids = np.arange(len(np.asarray(orig_pcd.points)))[keep_mask]
+                orig_pcd = orig_pcd.select_by_index(keep_ids)
 
             if args.denoise_cloud:
                 logging.info("[Optional step] denoise point cloud...")
@@ -436,7 +451,7 @@ if __name__=="__main__":
         z_min=-0.01, 
         z_max=0.01,
         min_fitness_score=0.5,
-        early_stop_fitness_score=0.82,
+        early_stop_fitness_score=0.85,
         max_iterations=50,
         max_correspondence_distance=0.005,
     )
@@ -452,18 +467,67 @@ if __name__=="__main__":
 
     # Compute the final transformation matrix
     # Note: T_reference2scene_icp is the transformation from the roughly aligned ref pcd to the scene pcd
-    T_reference2scene_final = T_reference2scene_icp @ T_reference2scene
+    T_reference2scene_refined = T_reference2scene_icp @ T_reference2scene
+
+    # Perform the rotation-sampled point-to-plane ICP refinement
+    local_rotation_axis_samples = ['z']
+    rotation_angle_samples = [0, 180]
+    highest_fitness_score = -1
+    T_reference2scene_final = None
+    icp_p2plane_registration = PointToPlaneICPRegistration(
+        max_iterations=50,
+        max_correspondence_distance=0.002,
+        normal_search_radius=0.02,
+        use_robust_kernel=True,
+        min_fitness_score=0.4
+    )
+    for axis in local_rotation_axis_samples:
+        for angle in rotation_angle_samples:
+            print(f"Applying additional rotation of {angle} degrees around local {axis}-axis and refining with point-to-plane ICP...")
+            # Apply the rotation to the final transformation matrix
+            R = o3d.geometry.get_rotation_matrix_from_axis_angle(
+                np.radians(angle) * np.array([1 if axis == 'x' else 0, 1 if axis == 'y' else 0, 1 if axis == 'z' else 0])
+            )
+            T_rotated = np.eye(4)
+            T_rotated[:3, :3] = T_reference2scene_refined[:3, :3] @ R  # post-multiply for local-axis rotation
+            T_rotated[:3, 3] = T_reference2scene_refined[:3, 3]
+            # Note: use reference_pcd instead of transformed_reference_pcd_icp because of local rotation
+            transformed_reference_pcd_icp_2 = copy.deepcopy(reference_pcd).transform(T_rotated)
+            # Refine the alignment with point-to-plane ICP
+            T_reference2scene_final_cand, metric = icp_p2plane_registration.execute(
+                source_point_cloud=transformed_reference_pcd_icp_2, 
+                target_point_cloud=scaled_cloud, 
+                initial_transformation_matrix=np.eye(4)
+            )
+            if metric is None:
+                continue
+            if metric["fitness"] > highest_fitness_score:
+                highest_fitness_score = metric["fitness"]
+                T_reference2scene_final = T_reference2scene_final_cand @ T_rotated
+    # Visualize the final alignment result by transforming the reference point cloud with the final transformation
+    # and visualizing it together with the scene point cloud
+    T_reference2scene_final = T_reference2scene_final if T_reference2scene_final is not None else T_reference2scene_refined
+    transformed_reference_pcd_final = copy.deepcopy(reference_pcd).transform(T_reference2scene_final)
+    o3d.visualization.draw_geometries([scaled_cloud, transformed_reference_pcd_final], mesh_show_back_face=True)
 
     # Visualize the coordinate frame of the estimated pose in the point cloud
     coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
-        size=0.01,
+        size=0.02,
         origin=np.array([0., 0., 0.])
     )
     coordinate_frame.transform(T_reference2scene_final)
-    o3d.visualization.draw_geometries([scaled_cloud, coordinate_frame])
+    o3d.visualization.draw_geometries([orig_pcd, coordinate_frame])
+
+    # Compute the transformation from the tcp to the object (i.e., obj_T_tcp)
+    T_cam2obj = T_reference2scene_final
+    T_cam2world = T_left_2_w
+    # TODO: this needs to be acquired in run-time from the robot state
+    T_tcp2world = np.eye(4)
+    T_tcp2cam = np.linalg.inv(T_cam2world) @ T_tcp2world # assuming the left camera is the reference camera for point cloud generation and pose estimation
+    T_tcp2obj = T_tcp2cam @ T_cam2obj
+    # T_tcp2world = T_obj2world @ T_tcp2obj  # This is the final formula to get the target tcp pose in world frame when it comes to e.g. placing object at the target location.
 
 
     # TODO: steps in the next for object pose estimation in the conventional way
-    # 6) Transform the estimated pose from the camera frame to the world frame using the camera extrinsics
     # 7) Validate the estimated pose by projecting the object mesh with the estimated pose back to the image and check if the projection aligns well with the observed object in the image (e.g. using a silhouette IoU metric or visualizing the overlay)
 
