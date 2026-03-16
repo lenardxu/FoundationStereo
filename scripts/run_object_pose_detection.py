@@ -40,7 +40,7 @@ import torch
 
 from detection import QWENVDetector
 from measurement import calculate_point_cloud_principle_axes
-from registration import register_point_clouds_using_axis_point
+from registration import register_point_clouds_using_axis_point, CuboidTranslationSamplerPointToPointICPRegistration
 
 
 os.environ["all_proxy"] = "https://socks.127.0.0.1:7890"
@@ -356,7 +356,7 @@ if __name__=="__main__":
             vis.destroy_window()
     
     # Load the mesh model of the reference object (e.g. from a obj file)
-    mesh_filepath: str = ""
+    mesh_filepath: str = "/home/hillbot/rkx/3d_models/c_chang/electrode_path.obj"
     enable_post_processing = True
     print_progress = True
     converted_path = pathlib.Path(mesh_filepath)
@@ -369,7 +369,7 @@ if __name__=="__main__":
         raise RuntimeError("Mesh load failed or OBJ contains no valid triangles.")
     
     # Convert mesh to point cloud
-    num_points = 50000
+    num_points = 30000
     reference_mesh.compute_vertex_normals()
     reference_pcd = reference_mesh.sample_points_uniformly(
         number_of_points=num_points
@@ -395,8 +395,8 @@ if __name__=="__main__":
     print(f"Point cloud bounds (max) after scaling: {scaled_cloud.get_max_bound()}")
 
     # Voxel downsample both the reference point cloud and the observed point cloud
-    voxel_size = 0.001
-    reference_voxel_size = 0.001
+    voxel_size = 0.003
+    reference_voxel_size = 0.003
     print(f"Pcd of points before voxel downsampling: {len(scaled_cloud.points)}.")
     downsampled_pcd = scaled_cloud.voxel_down_sample(voxel_size=voxel_size)
     print(f"Voxel downsampling filter returns pcd of points: {len(downsampled_pcd.points)}.")
@@ -426,8 +426,44 @@ if __name__=="__main__":
     transformed_reference_pcd = copy.deepcopy(reference_pcd).transform(T_reference2scene)
     o3d.visualization.draw_geometries([scaled_cloud, transformed_reference_pcd], mesh_show_back_face=True)
 
+    # Refine the alignment with ICP
+    icp_registration = CuboidTranslationSamplerPointToPointICPRegistration(
+        step_size=0.001,
+        x_min=-0.01, 
+        x_max=0.01,
+        y_min=-0.01, 
+        y_max=0.01,
+        z_min=-0.01, 
+        z_max=0.01,
+        min_fitness_score=0.5,
+        early_stop_fitness_score=0.82,
+        max_iterations=50,
+        max_correspondence_distance=0.005,
+    )
+    T_reference2scene_icp, _ = icp_registration.execute(
+        source_point_cloud=transformed_reference_pcd, 
+        target_point_cloud=scaled_cloud, 
+        initial_transformation_matrix=np.eye(4)
+    )
+    # Visualize the refined alignment result by transforming the reference point cloud with the estimated transformation further
+    # and visualizing it together with the scene point cloud
+    transformed_reference_pcd_icp = copy.deepcopy(transformed_reference_pcd).transform(T_reference2scene_icp)
+    o3d.visualization.draw_geometries([scaled_cloud, transformed_reference_pcd_icp], mesh_show_back_face=True)
+
+    # Compute the final transformation matrix
+    # Note: T_reference2scene_icp is the transformation from the roughly aligned ref pcd to the scene pcd
+    T_reference2scene_final = T_reference2scene_icp @ T_reference2scene
+
+    # Visualize the coordinate frame of the estimated pose in the point cloud
+    coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=0.01,
+        origin=np.array([0., 0., 0.])
+    )
+    coordinate_frame.transform(T_reference2scene_final)
+    o3d.visualization.draw_geometries([scaled_cloud, coordinate_frame])
+
+
     # TODO: steps in the next for object pose estimation in the conventional way
-    # 5) Visualize the coordinate frame of the estimated pose in the point cloud as well
     # 6) Transform the estimated pose from the camera frame to the world frame using the camera extrinsics
     # 7) Validate the estimated pose by projecting the object mesh with the estimated pose back to the image and check if the projection aligns well with the observed object in the image (e.g. using a silhouette IoU metric or visualizing the overlay)
 

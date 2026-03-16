@@ -655,19 +655,33 @@ class QWENVDetector(BaseShapeDetector):
     def _initialize(self):
         model_name = self._params["model_name"]
         print(f"[{self._class_name}._initialize] Loading model: {model_name}")
+        # os.environ["HF_HUB_OFFLINE"] = "1"
 
-        self._model = Qwen3VLForConditionalGeneration.from_pretrained(
-            model_name,
-            # torch_dtype="auto",
-            # device_map="auto",
-        )
+        try:
+            self._model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                # torch_dtype="auto",
+                # device_map="auto",
+            )
+        except Exception:
+            print(f"[{self._class_name}._initialize] Network unavailable, loading model from local cache")
+            self._model = Qwen3VLForConditionalGeneration.from_pretrained(
+                model_name,
+                # torch_dtype="auto",
+                # device_map="auto",
+                local_files_only=True,
+            )
         self._model_on_gpu = False
         self._device = next(self._model.parameters()).device
         if self._device.type == "cuda":
             print(f"[{self._class_name}._initialize] Model is on GPU")
             self._model_on_gpu = True
 
-        self._processor = AutoProcessor.from_pretrained(model_name)
+        try:
+            self._processor = AutoProcessor.from_pretrained(model_name)
+        except Exception:
+            print(f"[{self._class_name}._initialize] Network unavailable, loading processor from local cache")
+            self._processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
         print(f"[{self._class_name}._initialize] Model loaded on {self._device}")
 
     # ------------------------------------------------------------------
